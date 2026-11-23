@@ -1,0 +1,46 @@
+{
+  "name": "ctrlpi-remote",
+  "version": "0.9.50",
+  "description": "A stdio MCP server that forwards to a ctrlpi-mcp, pico-bay or pi-bay running in HTTP mode on another machine, such as a Raspberry Pi on your LAN. Finds it, claims its key, and talks to it with that key only.",
+  "main": "ctrlpi-remote.js",
+  "files": [
+    "ctrlpi-remote.js"
+  ],
+  "bin": {
+    "ctrlpi-remote": "ctrlpi-remote.js"
+  },
+  "scripts": {
+    "start": "node ctrlpi-remote.js",
+    "test": "node --test test/ctrlpi-remote.test.js",
+    "prepublishOnly": "npm test"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ctrlpi/ctrlpi-remote.git"
+  },
+  "keywords": [
+    "mcp",
+    "model context protocol",
+    "model-context-protocol",
+    "remote",
+    "proxy",
+    "raspberry pi",
+    "raspberry-pi",
+    "pico",
+    "esp32",
+    "claude",
+    "ai",
+    "ctrlpi",
+    "iot"
+  ],
+  "author": "ctrlPi",
+  "license": "MIT",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=20"
+  },
+  "bugs": {
+    "url": "https://github.com/ctrlpi/ctrlpi-remote/issues"
+  },
+  "homepage": "https://github.com/ctrlpi/ctrlpi-remote"
+}

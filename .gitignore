@@ -1,0 +1,35 @@
+# Dependencies
+node_modules/
+package-lock.json
+
+# Logs
+*.log
+npm-debug.log*
+
+# macOS / iCloud
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+
+# Virtual environments
+venv/
+.venv/
+env/
+.env
+.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Project-specific
+config.json
+agents-config.json
