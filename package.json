@@ -1,7 +1,7 @@
 {
   "name": "ctrlpi-remote",
-  "version": "0.9.50",
-  "description": "A stdio MCP server that forwards to a ctrlpi-mcp, pico-bay or pi-bay running in HTTP mode on another machine, such as a Raspberry Pi on your LAN. Finds it, claims its key, and talks to it with that key only.",
+  "version": "0.9.51",
+  "description": "A stdio MCP server that forwards to the ctrlpi-mcp, pico-bay and pi-bay servers running in HTTP mode on other machines, such as a Raspberry Pi on your LAN. Finds them, claims each key, and talks to each with that key only.",
   "main": "ctrlpi-remote.js",
   "files": [
     "ctrlpi-remote.js"

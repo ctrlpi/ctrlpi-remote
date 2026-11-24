@@ -1,7 +1,7 @@
 #!/usr/bin/env node
-// ctrlpi-remote: a stdio MCP server that forwards every MCP message to a ctrlpi-mcp, pico-bay
-// or pi-bay running in HTTP mode on another machine. It finds the server on the LAN with
-// GET /hello, claims its key the first time, and from then on talks to it with that key only.
+// ctrlpi-remote: a stdio MCP server that forwards to the ctrlpi-mcp, pico-bay and pi-bay
+// servers running in HTTP mode on other machines. It finds them on the LAN with GET /hello,
+// claims each key the first time, and from then on talks to each with that key only.
 'use strict';
 
 const http = require('http');
@@ -11,27 +11,34 @@ const path = require('path');
 const dgram = require('dgram');
 const crypto = require('crypto');
 const readline = require('readline');
+const { execFile } = require('child_process');
 
 const VERSION = require('./package.json').version;
 
-// The three servers: default port, the list tool that fans out over several hosts, and
-// whether only one server may be used (ctrlpi-mcp: two would drive the same agents).
+// The three servers: default port, tool name prefix, the list tool that fans out over
+// several hosts, the UI tool, and whether only one server may be used (ctrlpi-mcp: two would
+// drive the same agents).
 const TARGETS = {
-  'ctrlpi-mcp': { port: 8315, listTool: 'mcp_agents_list', single: true },
-  'pico-bay': { port: 7426, listTool: 'pico_boards_list', single: false },
-  'pi-bay': { port: 3141, listTool: 'pi_devices_list', single: false },
+  'ctrlpi-mcp': { port: 8315, prefix: 'mcp_', listTool: 'mcp_agents_list', uiTool: null, single: true },
+  'pico-bay': { port: 7426, prefix: 'pico_', listTool: 'pico_boards_list', uiTool: 'pico_ui', single: false },
+  'pi-bay': { port: 3141, prefix: 'pi_', listTool: 'pi_devices_list', uiTool: 'pi_ui', single: false },
 };
+const TARGET_NAMES = Object.keys(TARGETS);
 const DEFAULT_KEY = 'your-mcp-key';
 const MODERN_PROTOCOL = '2026-07-28';
 const HELLO_TIMEOUT_MS = Number(process.env.CTRLPI_REMOTE_HELLO_TIMEOUT_MS) || 1500;
 const CONNECT_TIMEOUT_MS = 5000;
 const SWEEP_PARALLEL = 48;
+const LEGACY_PROTOCOLS = ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'];
 
-const USAGE = `Usage: ctrlpi-remote <ctrlpi-mcp | pico-bay | pi-bay> [options]
+const USAGE = `Usage: ctrlpi-remote [ctrlpi-mcp | pico-bay | pi-bay] [options]
+
+With no server named, it serves all three, or the ones listed in "targets" in
+remote-config.json.
 
 Options:
-  --host ADDRESS   Use the server at this address (no LAN search)
-  --port PORT      Its port (default 8315, 7426 or 3141)
+  --host ADDRESS   Use the servers at this address (no LAN search)
+  --port PORT      Its port, with a server named (default 8315, 7426 or 3141)
   --config PATH    Config folder, or the remote-config.json file itself
   --rotate-keys    Give each server a new random key, save it, and exit
   --help           Show this help
@@ -64,8 +71,8 @@ function parseArgs(argv) {
     else opts.target = a;
   }
   if (!opts.help && !opts.version) {
-    if (!opts.target) throw new Error('name a target: ctrlpi-mcp, pico-bay or pi-bay');
-    if (!TARGETS[opts.target]) throw new Error('unknown target ' + opts.target + ': use ctrlpi-mcp, pico-bay or pi-bay');
+    if (opts.target && !TARGETS[opts.target]) throw new Error('unknown target ' + opts.target + ': use ctrlpi-mcp, pico-bay or pi-bay');
+    if (opts.port && !opts.target) throw new Error('--port needs a target: ctrlpi-mcp, pico-bay or pi-bay');
   }
   return opts;
 }
@@ -83,6 +90,14 @@ function loadConfig(file) {
     const cfg = JSON.parse(fs.readFileSync(file, 'utf8'));
     return cfg && typeof cfg === 'object' && !Array.isArray(cfg) ? cfg : {};
   } catch { return {}; }
+}
+
+// The targets to serve: the one on the command line, else "targets" in the config file (the
+// known names in it), else all three.
+function enabledTargets(file, target) {
+  if (target) return [target];
+  const list = loadConfig(file).targets;
+  return Array.isArray(list) ? TARGET_NAMES.filter(t => list.includes(t)) : TARGET_NAMES;
 }
 
 // A target's saved servers: entries with a valid ip and port.
@@ -255,7 +270,7 @@ async function claim(file, target, server, keep) {
 // The servers to use: the saved ones that answer, moved ones found again (their saved key
 // goes to a new address only once the old one is dead), and new ones claimed.
 // Returns {servers, problems}.
-async function resolveServers({ target, host, port, configFile }) {
+async function resolveServers({ target, host, port, configFile, force = false }) {
   const spec = TARGETS[target];
   const problems = [];
   let saved = savedServers(configFile, target);
@@ -295,8 +310,8 @@ async function resolveServers({ target, host, port, configFile }) {
     }
   }
 
-  // Search when nothing is saved or a saved address is dead.
-  if (saved.length === 0 || dead.length > 0) {
+  // Search when nothing is saved, a saved address is dead, or a rescan asks for it.
+  if (force || saved.length === 0 || dead.length > 0) {
     const known = new Set(alive.map(a => a.server.ip + ':' + a.server.port));
     const found = (await sweep(target, port || spec.port)).filter(f => !known.has(f.ip + ':' + f.port));
     let missing = dead.filter(d => d.api_key);
@@ -319,17 +334,17 @@ async function resolveServers({ target, host, port, configFile }) {
           log(target + ' moved to ' + label(target, moved) + ', saved');
           servers.push(moved);
         } else {
-          log(target + ' on ' + label(target, f) + ' is claimed by another client: skipped (put its key in ' + configFile + ' to use it)');
+          problems.push(target + ' on ' + label(target, f) + ' is already claimed: put its key in ' + configFile + ' to use it');
         }
       } else {
         const entry = await claim(configFile, target, f, saved);
         if (entry) {
           saved = [...saved, entry];
           servers.push(entry);
-        }
+        } else problems.push('could not claim ' + target + ' on ' + label(target, f));
       }
     }
-    for (const d of missing) log(target + ' on ' + label(target, d) + ' does not answer');
+    for (const d of missing) problems.push(target + ' on ' + label(target, d) + ' does not answer');
   }
 
   if (spec.single && servers.length > 1) {
@@ -341,33 +356,35 @@ async function resolveServers({ target, host, port, configFile }) {
   return { servers: servers.sort(addressOrder), problems };
 }
 
-// --rotate-keys: a new random key for every server, saved on 200.
+// --rotate-keys: a new random key for every server of every target served, saved on 200.
 async function rotateKeys(opts, configFile) {
-  const { servers, problems } = await resolveServers({ ...opts, configFile });
-  for (const p of problems) log(p);
-  if (!servers.length) return 1;
-  let failed = 0;
-  for (const s of servers) {
-    const key = newKey();
-    let res;
-    try {
-      res = await request(s.ip, s.port, 'POST', '/remote-config', {
-        headers: { 'Content-Type': 'application/json', 'Api-Key': s.api_key },
-        body: JSON.stringify({ api_key: key }), timeout: 10000,
-      });
-    } catch (error) { res = { status: 0, body: String(error.message || error) }; }
-    if (res.status !== 200) {
-      failed++;
-      log('could not rotate the key on ' + label(opts.target, s) + ' (' + (res.status || res.body) + ')');
-      continue;
+  let failed = 0, found = 0;
+  for (const target of enabledTargets(configFile, opts.target)) {
+    const { servers, problems } = await resolveServers({ ...opts, target, configFile });
+    for (const p of problems) log(p);
+    found += servers.length;
+    for (const s of servers) {
+      const key = newKey();
+      let res;
+      try {
+        res = await request(s.ip, s.port, 'POST', '/remote-config', {
+          headers: { 'Content-Type': 'application/json', 'Api-Key': s.api_key },
+          body: JSON.stringify({ api_key: key }), timeout: 10000,
+        });
+      } catch (error) { res = { status: 0, body: String(error.message || error) }; }
+      if (res.status !== 200) {
+        failed++;
+        log('could not rotate the key on ' + target + ' ' + label(target, s) + ' (' + (res.status || res.body) + ')');
+        continue;
+      }
+      let keySet = nowStamp();
+      try { keySet = JSON.parse(res.body).key_set || keySet; } catch { /* keep ours */ }
+      const list = savedServers(configFile, target).map(e => (e.ip === s.ip && e.port === s.port ? { ...e, api_key: key, key_set: keySet, updated_at: nowStamp() } : e));
+      saveServers(configFile, target, list);
+      log('new key for ' + target + ' on ' + label(target, s) + ', saved to ' + configFile);
     }
-    let keySet = nowStamp();
-    try { keySet = JSON.parse(res.body).key_set || keySet; } catch { /* keep ours */ }
-    const list = savedServers(configFile, opts.target).map(e => (e.ip === s.ip && e.port === s.port ? { ...e, api_key: key, key_set: keySet, updated_at: nowStamp() } : e));
-    saveServers(configFile, opts.target, list);
-    log('new key for ' + label(opts.target, s) + ', saved to ' + configFile);
   }
-  return failed ? 1 : 0;
+  return failed || !found ? 1 : 0;
 }
 
 // ── Forwarding ─────────────────────────────────────────────────────────────
@@ -393,6 +410,7 @@ function protocolHeaders(msg, negotiated) {
 
 const isRequest = msg => msg && msg.id !== undefined && msg.id !== null;
 const rpcError = (id, code, message) => ({ jsonrpc: '2.0', id, error: { code, message } });
+const toolReply = (id, value) => ({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: JSON.stringify(value, null, 2) }], structuredContent: value } });
 
 // The JSON-RPC messages in a 200 answer: one JSON body, or the data: lines of an event stream.
 function answerMessages(res) {
@@ -407,14 +425,97 @@ function answerMessages(res) {
   try { return [JSON.parse(res.body)]; } catch { return []; }
 }
 
-function createProxy(target, servers, startupProblems, write) {
-  const spec = TARGETS[target];
-  const multi = servers.length > 1;
-  const labelOf = s => label(target, s);
-  for (const s of servers) { s.session = null; s.negotiated = null; s.initMsg = null; }
+// ── Opening a remote UI here ───────────────────────────────────────────────
+// Only on a desktop session: not over SSH, and on Linux only with a display.
+function localDesktop(env = process.env) {
+  if (env.SSH_CONNECTION) return false;
+  return process.platform !== 'linux' || Boolean(env.DISPLAY || env.WAYLAND_DISPLAY);
+}
+
+function openBrowser(url) {
+  // Tests: CTRLPI_REMOTE_BROWSER is a script that records the URL.
+  if (process.env.CTRLPI_REMOTE_BROWSER) execFile(process.execPath, [process.env.CTRLPI_REMOTE_BROWSER, url], () => {});
+  else if (process.platform === 'darwin') execFile('open', [url], () => {});
+  else if (process.platform === 'win32') execFile('cmd.exe', ['/c', 'start', '""', url], () => {});
+  else execFile('xdg-open', [url], () => {});
+}
+
+// A UI tool answered opened: false with the url to open: open it here when it is the
+// address of the server that answered, and say so in the result.
+function openUiLocally(server, reply) {
+  const result = reply && reply.result;
+  if (!result || result.isError || !Array.isArray(result.content) || !result.content[0] || !localDesktop()) return reply;
+  let value, url;
+  try { value = JSON.parse(result.content[0].text); } catch { return reply; }
+  if (!value || value.opened !== false || typeof value.url !== 'string') return reply;
+  try { url = new URL(value.url); } catch { return reply; }
+  if (url.protocol !== 'http:' || url.hostname !== server.ip.toLowerCase() || Number(url.port || 80) !== server.port) return reply;
+  openBrowser(url.href);
+  const opened = { url: value.url, opened: true };
+  const out = { ...result, content: [{ type: 'text', text: JSON.stringify(opened, null, 2) }] };
+  if (result.structuredContent) out.structuredContent = opened;
+  return { ...reply, result: out };
+}
+
+// ── The proxy ──────────────────────────────────────────────────────────────
+const EMPTY_SCHEMA = { type: 'object', properties: {}, additionalProperties: false };
+const BUILTIN_TOOLS = [
+  {
+    name: 'remote_servers_list',
+    description: 'List the ctrlpi-mcp, pico-bay and pi-bay servers found on the LAN and in use, and why any is missing (claimed by another computer, MCP switched off, not answering, turned off in remote-config.json).',
+    inputSchema: EMPTY_SCHEMA, annotations: { readOnlyHint: true },
+  },
+  {
+    name: 'remote_rescan',
+    description: 'Search the LAN again for ctrlpi-mcp, pico-bay and pi-bay servers started or moved since, and return what remote_servers_list returns.',
+    inputSchema: EMPTY_SCHEMA, annotations: { readOnlyHint: false },
+  },
+];
+const RESCAN_HINT = 'Make sure it runs with its HTTP MCP on (--mcp http), then call remote_rescan to search the LAN again; remote_servers_list says why a server is missing.';
+const INSTRUCTIONS = 'Tools of the ctrlPi servers found on the LAN: mcp_* (ctrlpi-mcp: GPIO agents), pico_* (pico-bay: Pico and ESP32 boards), pi_* (pi-bay: Raspberry Pis and SSH devices). When tools are missing, call remote_servers_list; remote_rescan searches again.';
+
+function createProxy({ target = null, host = null, port = null, configFile }, write) {
+  const kinds = {}; // target -> { servers, problems, listError }
+  let clientInit = null;
+  let scanning = null;
+  let searched = false;
+
+  const signature = () => JSON.stringify(TARGET_NAMES.map(t => (kinds[t] ? kinds[t].servers.map(s => label(t, s)) : [])));
+
+  // Finds the servers of every target served, at start and on remote_rescan.
+  // Servers already in use keep their session. Tells the client when the tools change.
+  function scan({ force = false } = {}) {
+    if (scanning) return scanning;
+    scanning = (async () => {
+      const before = signature();
+      const enabled = enabledTargets(configFile, target);
+      for (const t of TARGET_NAMES) {
+        if (!enabled.includes(t)) kinds[t] = { servers: [], problems: ['turned off in ' + configFile + ' ("targets")'], listError: null };
+      }
+      await Promise.all(enabled.map(async t => {
+        const old = kinds[t];
+        let resolved;
+        try { resolved = await resolveServers({ target: t, host, port, configFile, force }); } catch (error) {
+          resolved = { servers: [], problems: [String(error.message || error)] };
+        }
+        const servers = resolved.servers.map(s => (old && old.servers.find(o => o.ip === s.ip && o.port === s.port && o.api_key === s.api_key)) ||
+          { ...s, target: t, session: null, negotiated: null, initMsg: null, init: null });
+        if (!old || JSON.stringify(old.problems) !== JSON.stringify(resolved.problems)) for (const p of resolved.problems) log(p);
+        if (servers.length && (!old || JSON.stringify(old.servers.map(s => label(t, s))) !== JSON.stringify(servers.map(s => label(t, s))))) {
+          log('forwarding to ' + t + ' on ' + servers.map(s => label(t, s)).join(', '));
+        }
+        kinds[t] = { servers, problems: resolved.problems, listError: null };
+      }));
+      if (searched && clientInit && signature() !== before) write({ jsonrpc: '2.0', method: 'notifications/tools/list_changed' });
+      searched = true;
+    })().finally(() => { scanning = null; });
+    return scanning;
+  }
+  const ready = scan();
 
   // POSTs one message to one server. Returns the messages to write (possibly none).
   async function post(server, msg, retried = false) {
+    const t = server.target;
     const headers = {
       'Content-Type': 'application/json',
       Accept: 'application/json, text/event-stream',
@@ -426,7 +527,7 @@ function createProxy(target, servers, startupProblems, write) {
     try {
       res = await request(server.ip, server.port, 'POST', '/mcp', { headers, body: JSON.stringify(msg) });
     } catch (error) {
-      return isRequest(msg) ? [rpcError(msg.id, -32000, 'Cannot reach ' + target + ' on ' + labelOf(server) + ': ' + String(error.message || error))] : [];
+      return isRequest(msg) ? [rpcError(msg.id, -32000, 'Cannot reach ' + t + ' on ' + label(t, server) + ': ' + String(error.message || error))] : [];
     }
     if (res.status === 202) return [];
     if (msg.method === 'initialize' && res.status === 200) {
@@ -437,7 +538,7 @@ function createProxy(target, servers, startupProblems, write) {
     }
     if (res.status === 200) return answerMessages(res);
     if (res.status === 403) {
-      return isRequest(msg) ? [rpcError(msg.id, -32001, target + ' on ' + labelOf(server) + ' rejected the key saved in remote-config.json')] : [];
+      return isRequest(msg) ? [rpcError(msg.id, -32001, t + ' on ' + label(t, server) + ' rejected the key saved in remote-config.json')] : [];
     }
     if (res.status === 404) {
       // A JSON-RPC body is the server's own answer (an unknown method); anything else means
@@ -453,28 +554,60 @@ function createProxy(target, servers, startupProblems, write) {
           return post(server, msg, true);
         }
       }
-      return isRequest(msg) ? [rpcError(msg.id, -32002, 'MCP is switched off on ' + target + ' at ' + labelOf(server))] : [];
+      return isRequest(msg) ? [rpcError(msg.id, -32002, 'MCP is switched off on ' + t + ' at ' + label(t, server) + ': turn its HTTP MCP on, then call remote_rescan')] : [];
     }
     let detail = '';
     try { detail = JSON.parse(res.body).error; detail = typeof detail === 'string' ? detail : (detail && detail.message) || ''; } catch { /* no detail */ }
-    return isRequest(msg) ? [rpcError(msg.id, -32000, target + ' on ' + labelOf(server) + ' answered HTTP ' + res.status + (detail ? ': ' + detail : ''))] : [];
+    return isRequest(msg) ? [rpcError(msg.id, -32000, t + ' on ' + label(t, server) + ' answered HTTP ' + res.status + (detail ? ': ' + detail : ''))] : [];
   }
 
-  // The servers that answer /hello right now.
-  async function aliveServers() {
-    const checks = await Promise.all(servers.map(async s => ({ s, h: await hello(s.ip, s.port) })));
-    return checks.filter(c => c.h && c.h.service === target).map(c => c.s);
+  // A server is initialized with the client's own initialize the first time it is used.
+  // Resolves to null, or the error reply.
+  function ensureInit(server) {
+    if (!clientInit || server.initMsg) return Promise.resolve(null);
+    if (!server.init) {
+      server.init = (async () => {
+        const [reply] = await post(server, clientInit);
+        if (reply && reply.result) {
+          await post(server, { jsonrpc: '2.0', method: 'notifications/initialized' });
+          return null;
+        }
+        return reply || rpcError(null, -32000, label(server.target, server) + ' did not answer initialize');
+      })().finally(() => { server.init = null; });
+    }
+    return server.init;
   }
 
-  // Several servers: every tool gets a `host` argument naming one of them.
-  async function toolsList(msg) {
-    const live = await aliveServers();
-    if (!live.length) return [rpcError(msg.id, -32000, 'no ' + target + ' answers right now')];
-    const replies = await post(live[0], msg);
-    const reply = replies[0];
-    if (!reply || !reply.result || !Array.isArray(reply.result.tools)) return replies;
-    const hosts = live.map(labelOf);
-    reply.result.tools = reply.result.tools.map(tool => {
+  async function send(server, msg) {
+    const failed = await ensureInit(server);
+    if (failed) return isRequest(msg) ? [{ ...failed, id: msg.id }] : [];
+    return post(server, msg);
+  }
+
+  // The servers of a target that answer /hello right now.
+  async function aliveServers(t) {
+    const checks = await Promise.all(kinds[t].servers.map(async s => ({ s, h: await hello(s.ip, s.port) })));
+    return checks.filter(c => c.h && c.h.service === t).map(c => c.s);
+  }
+
+  // One target's tools, with a `host` argument when it has several servers. Null when none.
+  async function targetTools(t, msg) {
+    const kind = kinds[t];
+    if (!kind || !kind.servers.length) return null;
+    const live = await aliveServers(t);
+    if (!live.length) { kind.listError = 'no ' + t + ' answers right now'; return null; }
+    const [reply] = await send(live[0], msg);
+    if (!reply || !reply.result || !Array.isArray(reply.result.tools)) {
+      kind.listError = (reply && reply.error && reply.error.message) || t + ' sent no tool list';
+      log(kind.listError);
+      return null;
+    }
+    kind.listError = null;
+    const spec = TARGETS[t];
+    const tools = reply.result.tools.filter(tool => tool && typeof tool.name === 'string' && tool.name.startsWith(spec.prefix));
+    if (kind.servers.length < 2) return tools;
+    const hosts = live.map(s => label(t, s));
+    return tools.map(tool => {
       const schema = tool.inputSchema && typeof tool.inputSchema === 'object' ? tool.inputSchema : { type: 'object' };
       const list = tool.name === spec.listTool;
       return {
@@ -485,33 +618,71 @@ function createProxy(target, servers, startupProblems, write) {
             ...(schema.properties || {}),
             host: {
               type: 'string', enum: hosts,
-              description: list ? 'The ' + target + ' host to ask; leave it out to ask every host.' : 'The ' + target + ' host to run this on.',
+              description: list ? 'The ' + t + ' host to ask; leave it out to ask every host.' : 'The ' + t + ' host to run this on.',
             },
           },
           required: list ? (schema.required || []) : [...new Set([...(schema.required || []), 'host'])],
         },
       };
     });
-    return [reply];
   }
 
-  // Several servers: route by `host`, or fan a list tool out to every host and tag each result.
+  async function toolsList(msg) {
+    await ready;
+    const lists = await Promise.all(TARGET_NAMES.map(t => targetTools(t, msg)));
+    const tools = lists.filter(Boolean).flat().concat(BUILTIN_TOOLS);
+    return [{ jsonrpc: '2.0', id: msg.id, result: { tools } }];
+  }
+
+  // What remote_servers_list and remote_rescan return.
+  function report() {
+    const out = {};
+    for (const t of TARGET_NAMES) {
+      const kind = kinds[t] || { servers: [], problems: [], listError: null };
+      out[t] = { servers: kind.servers.map(s => label(t, s)), problems: kind.listError ? [...kind.problems, kind.listError] : kind.problems };
+    }
+    out.config = configFile;
+    if (TARGET_NAMES.every(t => !out[t].servers.length)) out.message = 'ctrlpi-remote is not connected to any server. ' + RESCAN_HINT;
+    return out;
+  }
+
+  // Routes by the tool's prefix, then by `host`; a list tool without `host` asks every host.
   async function toolsCall(msg) {
     const params = msg.params && typeof msg.params === 'object' ? msg.params : {};
+    const name = params.name;
+    if (name === 'remote_servers_list') { await ready; return [toolReply(msg.id, report())]; }
+    if (name === 'remote_rescan') {
+      while (scanning) await scanning; // the start-up search, not forced
+      await scan({ force: true });
+      return [toolReply(msg.id, report())];
+    }
+    await ready;
+    const t = TARGET_NAMES.find(n => typeof name === 'string' && name.startsWith(TARGETS[n].prefix));
+    if (!t) return [rpcError(msg.id, -32602, 'Unknown tool ' + name)];
+    const kind = kinds[t];
+    if (!kind || !kind.servers.length) {
+      return [rpcError(msg.id, -32000, 'ctrlpi-remote is not connected to a ' + t + ' server: ' + ((kind && kind.problems.join('; ')) || 'none found') + '. ' + RESCAN_HINT)];
+    }
+    const spec = TARGETS[t];
+    const run = async (server, m) => {
+      const replies = await send(server, m);
+      return name === spec.uiTool ? replies.map(r => openUiLocally(server, r)) : replies;
+    };
+    if (kind.servers.length < 2) return run(kind.servers[0], msg);
+
     const args = params.arguments && typeof params.arguments === 'object' ? { ...params.arguments } : {};
     const host = args.host;
     delete args.host;
     const forward = { ...msg, params: { ...params, arguments: args } };
+    const labels = kind.servers.map(s => label(t, s));
     if (host !== undefined) {
-      const server = servers.find(s => labelOf(s) === host);
-      if (!server) return [rpcError(msg.id, -32602, 'Unknown host ' + host + ': use one of ' + servers.map(labelOf).join(', '))];
-      return post(server, forward);
+      const server = kind.servers.find(s => label(t, s) === host);
+      if (!server) return [rpcError(msg.id, -32602, 'Unknown host ' + host + ': use one of ' + labels.join(', '))];
+      return run(server, forward);
     }
-    if (params.name !== spec.listTool) {
-      return [rpcError(msg.id, -32602, 'host is required: one of ' + servers.map(labelOf).join(', '))];
-    }
-    const live = await aliveServers();
-    const results = await Promise.all(live.map(async s => ({ s, reply: (await post(s, forward))[0] })));
+    if (name !== spec.listTool) return [rpcError(msg.id, -32602, 'host is required: one of ' + labels.join(', '))];
+    const live = await aliveServers(t);
+    const results = await Promise.all(live.map(async s => ({ s, reply: (await send(s, forward))[0] })));
     const merged = {};
     let first = null;
     let allFailed = true;
@@ -523,7 +694,7 @@ function createProxy(target, servers, startupProblems, write) {
       let value;
       if (!result) value = { error: (reply && reply.error && reply.error.message) || 'no answer' };
       else { try { value = JSON.parse(text); } catch { value = text; } }
-      merged[labelOf(s)] = value;
+      merged[label(t, s)] = value;
     }
     const result = { ...(first || {}), content: [{ type: 'text', text: JSON.stringify(merged, null, 2) }] };
     delete result.structuredContent;
@@ -532,22 +703,37 @@ function createProxy(target, servers, startupProblems, write) {
   }
 
   async function handle(msg) {
-    if (!servers.length) {
-      return isRequest(msg) ? [rpcError(msg.id, -32000, 'ctrlpi-remote has no ' + target + ' to talk to: ' + (startupProblems.join('; ') || 'none found'))] : [];
+    if (msg.method === 'initialize' && isRequest(msg)) {
+      // Answered here, at once; each server gets this initialize the first time it is used.
+      clientInit = msg;
+      for (const kind of Object.values(kinds)) for (const s of kind.servers) { s.initMsg = null; s.session = null; s.negotiated = null; }
+      const requested = msg.params && msg.params.protocolVersion;
+      return [{
+        jsonrpc: '2.0', id: msg.id,
+        result: {
+          protocolVersion: LEGACY_PROTOCOLS.includes(requested) ? requested : LEGACY_PROTOCOLS[0],
+          capabilities: { tools: { listChanged: true } },
+          serverInfo: { name: 'ctrlpi-remote', version: VERSION },
+          instructions: INSTRUCTIONS,
+        },
+      }];
     }
-    if (!multi) return post(servers[0], msg);
-    if (msg.method === 'initialize' || !isRequest(msg)) {
-      // Every server is initialized and gets every notification; the first answer is used.
-      const all = await Promise.all(servers.map(s => post(s, msg)));
-      if (!isRequest(msg)) return [];
-      return [all.map(r => r[0]).find(r => r && r.result) || all[0][0]].filter(Boolean);
+    if (!isRequest(msg)) {
+      // Our own notifications/initialized goes to each server after its initialize; the
+      // others go to every server already initialized.
+      if (msg.method !== 'notifications/initialized') {
+        const targets = Object.values(kinds).flatMap(k => k.servers).filter(s => s.initMsg);
+        await Promise.all(targets.map(s => post(s, msg)));
+      }
+      return [];
     }
+    if (msg.method === 'ping') return [{ jsonrpc: '2.0', id: msg.id, result: {} }];
     if (msg.method === 'tools/list') return toolsList(msg);
     if (msg.method === 'tools/call') return toolsCall(msg);
-    return post(servers[0], msg);
+    return [rpcError(msg.id, -32601, 'Method not found')];
   }
 
-  // One line from stdin: parse, forward, write each answer as one line.
+  // One line from stdin: parse, handle, write each answer as one line.
   async function line(text) {
     if (!text.trim()) return;
     let msg;
@@ -566,7 +752,7 @@ function createProxy(target, servers, startupProblems, write) {
     for (const reply of out) write(reply);
   }
 
-  return { line, handle };
+  return { line, handle, scan, report };
 }
 
 async function main() {
@@ -582,38 +768,24 @@ async function main() {
     process.exitCode = await rotateKeys(opts, configFile);
     return;
   }
-  // Start reading at once, so no message is lost while the servers are found. Requests run
-  // concurrently, and when stdin closes the ones already sent finish before the process exits.
-  const queue = [];
-  let proxy = null;
-  const rl = readline.createInterface({ input: process.stdin, terminal: false });
+  // Requests run concurrently, and when stdin closes the ones already sent finish before
+  // the process exits.
+  const proxy = createProxy({ ...opts, configFile }, msg => process.stdout.write(JSON.stringify(msg) + '\n'));
   const pending = new Set();
-  let closed = false;
-  const run = text => {
+  const rl = readline.createInterface({ input: process.stdin, terminal: false });
+  rl.on('line', text => {
     const p = proxy.line(text).finally(() => pending.delete(p));
     pending.add(p);
-  };
-  rl.on('line', text => (proxy ? run(text) : queue.push(text)));
-  rl.on('close', () => { closed = true; });
-
-  let resolved;
-  try { resolved = await resolveServers({ ...opts, configFile }); } catch (error) {
-    resolved = { servers: [], problems: [String(error.message || error)] };
-  }
-  for (const p of resolved.problems) log(p);
-  if (resolved.servers.length) log('forwarding to ' + opts.target + ' on ' + resolved.servers.map(s => label(opts.target, s)).join(', '));
-  proxy = createProxy(opts.target, resolved.servers, resolved.problems, msg => process.stdout.write(JSON.stringify(msg) + '\n'));
-  for (const text of queue.splice(0)) run(text);
-  const finish = async () => {
+  });
+  rl.on('close', async () => {
     while (pending.size) await Promise.allSettled([...pending]);
     process.exit(0);
-  };
-  if (closed) finish(); else rl.on('close', finish);
+  });
 }
 
 if (require.main === module) main();
 
 module.exports = {
-  TARGETS, parseArgs, resolveConfigFile, savedServers, saveServers, hello, sweep, localIp,
-  resolveServers, rotateKeys, protocolHeaders, headerValue, createProxy,
+  TARGETS, parseArgs, resolveConfigFile, enabledTargets, savedServers, saveServers, hello, sweep, localIp,
+  resolveServers, rotateKeys, protocolHeaders, headerValue, localDesktop, openUiLocally, createProxy,
 };
